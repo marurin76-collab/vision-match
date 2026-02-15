@@ -6,11 +6,28 @@
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
 
-# データファイル（リポジトリに含めない）
-data/
+# データファイル（embeddingsとcompany_order以外は除外）
+data/*.csv
+data/*.json
+data/*.xls
 *.xls
+
+# embeddingsはGit管理に含める（Streamlit Cloudで必要）
+!data/embeddings/
+
+# バックアップ・不要ファイル
 companies_fixed.csv
+companies_backup_*.csv
+
+# Docker（Streamlit Cloudでは不要）
+Dockerfile
+.dockerignore
 
 # スクリプト（データ収集・前処理用、デプロイ不要）
 scripts/
@@ -18,3 +35,15 @@ scripts/
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ログ・一時ファイル
+*.log
+*.tmp
