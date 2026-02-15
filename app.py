@@ -101,22 +101,17 @@ def load_companies():
     return df
 
 
-def compute_match(user_text, df, user_priorities=None, precomputed_embeddings=None, user_skills=""):
-    """2段階マッチング: 重み付きベクトル検索で候補絞り込み → Geminiで厳密評価
+def _vector_search(query_embedding, df, user_priorities=None, precomputed_embeddings=None):
+    """フィールド別重み付きベクトル検索で上位100社を抽出する共通関数
 
     Args:
-        user_text: ユーザーが入力した理想の社会像テキスト
+        query_embedding: クエリの埋め込みベクトル
         df: 企業データフレーム
         user_priorities: ユーザーが選択した重視する観点リスト
         precomputed_embeddings: 事前計算済みの埋め込みベクトル辞書
-        user_skills: ユーザーのスキル・経験テキスト
+    Returns:
+        上位100社のDataFrame（vector_score列付き）
     """
-    import re
-
-    user_text_clean = str(user_text).strip()
-    user_embedding = embed_query(user_text_clean)
-
-    # Stage 1: フィールド別重み付きベクトル類似度で上位100社を抽出
     field_weights = {
         "ideal_society": 0.35,
         "mission": 0.20,
@@ -125,7 +120,6 @@ def compute_match(user_text, df, user_priorities=None, precomputed_embeddings=No
         "description": 0.10,
     }
 
-    # ユーザーの重視観点に応じて重みを動的調整
     if user_priorities:
         priority_boost = {
             "社会貢献": {"ideal_society": 0.10, "mission": 0.05},
@@ -141,18 +135,15 @@ def compute_match(user_text, df, user_priorities=None, precomputed_embeddings=No
         total = sum(field_weights.values())
         field_weights = {k: v / total for k, v in field_weights.items()}
 
-    # フィールド別のコサイン類似度を計算して重み付け合成
     weighted_scores = np.zeros(len(df))
-    # フィルタ適用時のインデックスマッピング
     df_indices = df.index.tolist()
 
     for field, weight in field_weights.items():
         if precomputed_embeddings and field in precomputed_embeddings:
             all_embeddings = precomputed_embeddings[field]
-            # インデックスが埋め込み配列の範囲内かチェック
             if max(df_indices) < len(all_embeddings):
                 field_embeddings = all_embeddings[df_indices]
-                sims = _cosine_similarity(user_embedding, field_embeddings)
+                sims = _cosine_similarity(query_embedding, field_embeddings)
                 texts = df[field].fillna("").tolist()
                 non_empty_mask = np.array([bool(t.strip()) for t in texts])
                 sims[~non_empty_mask] = 0
@@ -163,11 +154,28 @@ def compute_match(user_text, df, user_priorities=None, precomputed_embeddings=No
                    "vision_score", "vision_reason", "ideal_society"]].copy()
     results["vector_score"] = (weighted_scores * 100).round(1).astype(float)
 
-    # vision_score（ビジョン実現度）をベクトルスコアに加味（最大+5点のボーナス）
     vs = pd.to_numeric(results["vision_score"], errors="coerce").fillna(0)
     results["vector_score"] = results["vector_score"] + (vs / 100 * 5).round(1)
 
-    top_candidates = results.sort_values("vector_score", ascending=False).head(100)
+    return results.sort_values("vector_score", ascending=False).head(100)
+
+
+def compute_match(user_text, df, user_priorities=None, precomputed_embeddings=None, user_skills=""):
+    """2段階マッチング: 重み付きベクトル検索で候補絞り込み → Geminiで厳密評価
+
+    Args:
+        user_text: ユーザーが入力した理想の社会像テキスト
+        df: 企業データフレーム
+        user_priorities: ユーザーが選択した重視する観点リスト
+        precomputed_embeddings: 事前計算済みの埋め込みベクトル辞書
+        user_skills: ユーザーのスキル・経験テキスト
+    """
+    import re
+
+    user_text_clean = str(user_text).strip()
+    user_embedding = embed_query(user_text_clean)
+
+    top_candidates = _vector_search(user_embedding, df, user_priorities, precomputed_embeddings)
     n_candidates = len(top_candidates)
 
     # Stage 2: Geminiで厳密に再評価
@@ -260,6 +268,185 @@ def compute_match(user_text, df, user_priorities=None, precomputed_embeddings=No
             match_scores.append(round(final_score, 1))
         else:
             # AIスコアが取れなかった場合はベクトルスコアをフォールバック
+            match_scores.append(top_list.iloc[idx]["vector_score"])
+    top_list["match_score"] = match_scores
+    top_list = top_list.sort_values("match_score", ascending=False).reset_index(drop=True)
+    return top_list
+
+
+def compute_match_refined(user_text, df, feedback, user_priorities=None,
+                          precomputed_embeddings=None, user_skills=""):
+    """フィードバックを反映したRocchio式マッチング
+
+    Args:
+        user_text: ユーザーが入力した理想の社会像テキスト
+        df: 企業データフレーム
+        feedback: {企業名: "good"/"bad"} のフィードバック辞書
+        user_priorities: ユーザーが選択した重視する観点リスト
+        precomputed_embeddings: 事前計算済みの埋め込みベクトル辞書
+        user_skills: ユーザーのスキル・経験テキスト
+    """
+    import re
+
+    user_text_clean = str(user_text).strip()
+    user_embedding = embed_query(user_text_clean)
+
+    # フィードバック企業の埋め込みベクトルを収集（5段階評価対応）
+    # rating→重み変換: 5→good 1.0, 4→good 0.5, 3→無視, 2→bad 0.5, 1→bad 1.0
+    good_weighted = []  # (vec, weight) のリスト
+    bad_weighted = []
+    for company_name, fb_data in feedback.items():
+        # 旧形式（"good"/"bad"）との互換性
+        if isinstance(fb_data, str):
+            rating = 5 if fb_data == "good" else 1
+        else:
+            rating = fb_data.get("rating", 3)
+        if rating == 3:
+            continue
+        company_rows = df[df["company"] == company_name]
+        if company_rows.empty or precomputed_embeddings is None:
+            continue
+        idx = company_rows.index[0]
+        # 各フィールドの埋め込みを平均して企業ベクトルとする
+        field_vecs = []
+        for field in ["ideal_society", "mission", "vision", "values", "description"]:
+            if field in precomputed_embeddings and idx < len(precomputed_embeddings[field]):
+                field_vecs.append(precomputed_embeddings[field][idx])
+        if field_vecs:
+            company_vec = np.mean(field_vecs, axis=0)
+            if rating >= 4:
+                weight = 1.0 if rating == 5 else 0.5
+                good_weighted.append((company_vec, weight))
+            else:
+                weight = 1.0 if rating == 1 else 0.5
+                bad_weighted.append((company_vec, weight))
+
+    # Rocchio式でクエリベクトルを修正（重み付き平均）
+    modified_query = user_embedding.copy()
+    if good_weighted:
+        total_w = sum(w for _, w in good_weighted)
+        good_mean = sum(v * w for v, w in good_weighted) / total_w
+        modified_query = modified_query + 0.75 * good_mean
+    if bad_weighted:
+        total_w = sum(w for _, w in bad_weighted)
+        bad_mean = sum(v * w for v, w in bad_weighted) / total_w
+        modified_query = modified_query - 0.25 * bad_mean
+
+    # 評価済み企業を除外してから検索
+    excluded = set(feedback.keys())
+    df_filtered = df[~df["company"].isin(excluded)]
+
+    # 修正したクエリでベクトル検索
+    top_candidates = _vector_search(modified_query, df_filtered, user_priorities, precomputed_embeddings)
+    n_candidates = len(top_candidates)
+
+    # Stage 2: Geminiで厳密に再評価（compute_matchと同じロジック）
+    gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+    companies_text = ""
+    for idx, (_, row) in enumerate(top_candidates.iterrows()):
+        ideal = row.get("ideal_society", "")
+        if not ideal or (isinstance(ideal, float)) or not str(ideal).strip():
+            ideal = " / ".join(filter(None, [row["mission"], row["vision"]]))
+        values_text = row.get("values", "")
+        if values_text and isinstance(values_text, str) and values_text.strip():
+            ideal += f"【バリュー】{values_text}"
+        companies_text += f"{idx+1}. {row['company']}（{row['industry']}）: {ideal}\n"
+
+    skills_instruction = ""
+    if user_skills and user_skills.strip():
+        skills_instruction = f"""
+
+【ユーザーのスキル・経験】
+{user_skills.strip()}
+"""
+
+    # フィードバック情報をプロンプトに追加（5段階評価対応）
+    rating_labels = {5: "とても合っている", 4: "やや合っている", 3: "どちらでもない", 2: "やや違う", 1: "違う"}
+    feedback_instruction = ""
+    if feedback:
+        fb_lines = []
+        for c, fb_data in feedback.items():
+            if isinstance(fb_data, str):
+                rating = 5 if fb_data == "good" else 1
+                comment = ""
+            else:
+                rating = fb_data.get("rating", 3)
+                comment = fb_data.get("comment", "")
+            label = rating_labels.get(rating, "")
+            line = f"- {c}: {rating}（{label}）"
+            if comment:
+                line += f" - {comment}"
+            fb_lines.append(line)
+        if fb_lines:
+            feedback_instruction = "\n\n【ユーザーのフィードバック（5段階評価）】\n"
+            feedback_instruction += "\n".join(fb_lines)
+            feedback_instruction += "\nこのフィードバックを参考に、高評価企業と似た方向性の企業を高く、低評価企業と似た方向性の企業を低く評価してください。コメントがある場合はその内容も考慮してください。"
+
+    prompt = f"""あなたは就職マッチングの厳格な審査員です。
+ユーザーが実現したい社会像と、以下の{n_candidates}社を比較し、「この企業に入ったらユーザーの理想を本当に実現できるか？」を総合的に評価してください。
+
+【ユーザーの理想の社会像】
+{user_text}
+{skills_instruction}{feedback_instruction}
+【候補企業と各社の目指す社会像・バリュー】
+{companies_text}
+
+■ 総合スコアの評価基準（100点満点）:
+以下の3つの観点を組み合わせて総合スコアをつけてください。
+
+【観点1: ビジョンの一致度（35%）】
+ユーザーの理想と企業が目指す方向性がどれだけ一致しているか。
+
+【観点2: 実現可能性（35%）】
+この企業でユーザーの理想を実際に実現できる可能性がどれだけあるか。
+以下の要素で判断すること：
+- 成長性・将来性（35%）: 新規事業、研究開発、変革への意欲。今後の伸びしろ
+- 方向性の本気度（30%）: ビジョンを口だけでなく事業や行動で示しているか
+- 挑戦・変革の姿勢（20%）: 既存の枠に囚われず新しいことに挑んでいるか
+- 実績・成果（15%）: 過去の取り組みの結果（参考程度）
+
+【観点3: スキル活用度（30%）】
+ユーザーが持つスキル・経験をこの企業で活かせるか。
+- ユーザーのスキルが企業の事業・ビジョンの実現に直接貢献できるか
+- スキルを活かしてユーザーの理想に近づける環境があるか
+- スキルが未記入の場合、この観点は無視して観点1と2のみで評価すること
+
+■ 重要な注意点:
+- 企業の規模や知名度は評価に含めない。小さくても志が高く成長中の企業を正当に評価すること
+- 「社会貢献している」等の抽象表現だけでは高スコアにしない
+- 業種が異なっても、目指す社会像が同じなら高スコアをつけてよい
+- 安易に高スコアをつけず、本当にマッチし実現可能性もある企業のみ70点以上にする
+- 平均スコアが50を超えないよう、厳格に採点すること
+
+以下の形式で{n_candidates}社すべてのスコアを出力してください（1行1社、番号とスコアのみ）:
+1: スコア
+2: スコア
+...
+{n_candidates}: スコア"""
+
+    ai_scores = {}
+    try:
+        response = gemini_model.generate_content(prompt)
+        for line in response.text.strip().split("\n"):
+            line = line.strip()
+            match = re.match(r"(\d+)\s*[:：]\s*(\d+)", line)
+            if match:
+                idx = int(match.group(1))
+                score = max(0, min(100, int(match.group(2))))
+                ai_scores[idx] = score
+    except Exception:
+        pass
+
+    top_list = top_candidates.reset_index(drop=True)
+    match_scores = []
+    for idx in range(len(top_list)):
+        ai_score = ai_scores.get(idx + 1, None)
+        if ai_score is not None:
+            vs_val = pd.to_numeric(top_list.iloc[idx].get("vision_score"), errors="coerce")
+            vs_bonus = (vs_val / 100 * 3) if pd.notna(vs_val) else 0
+            final_score = min(100, ai_score + vs_bonus)
+            match_scores.append(round(final_score, 1))
+        else:
             match_scores.append(top_list.iloc[idx]["vector_score"])
     top_list["match_score"] = match_scores
     top_list = top_list.sort_values("match_score", ascending=False).reset_index(drop=True)
@@ -421,6 +608,10 @@ if "user_priorities" not in st.session_state:
     st.session_state.user_priorities = []
 if "job_results" not in st.session_state:
     st.session_state.job_results = {}
+if "feedback" not in st.session_state:
+    st.session_state.feedback = {}
+if "refine_count" not in st.session_state:
+    st.session_state.refine_count = 0
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
@@ -694,6 +885,20 @@ st.markdown(
         color: #94a3b8; font-size: 0.82em;
     }
 
+    /* --- メインコンテンツ幅制限 --- */
+    .main .block-container {
+        max-width: 900px;
+        margin: 0 auto;
+    }
+
+    /* --- サイドバー絞り込みセクション --- */
+    .sidebar-refine {
+        background: #f0f4ff;
+        border-radius: 8px;
+        padding: 12px;
+        margin: 4px 0;
+    }
+
     /* --- モバイル対応 --- */
     @media (max-width: 768px) {
         .company-rank { font-size: 1.15em; }
@@ -735,6 +940,36 @@ with st.sidebar:
 
     if user_skills_selected:
         st.caption(f"選択中: {', '.join(user_skills_selected)}")
+
+    st.divider()
+
+    # --- 絞り込みセクション ---
+    st.markdown('<div class="sidebar-refine">', unsafe_allow_html=True)
+    feedback_count = len(st.session_state.feedback)
+    msg = f"評価済み: {feedback_count}件"
+    if st.session_state.refine_count > 0:
+        msg += f"（絞り込み {st.session_state.refine_count}回実行済み）"
+    st.markdown(f"**{msg}**")
+    if feedback_count >= 1:
+        if st.button("フィードバックで絞り込む", type="primary", use_container_width=True):
+            allowed, count = _check_and_increment_usage()
+            if not allowed:
+                st.error(f"本日のAPI利用回数が上限（{_DAILY_LIMIT}回）に達しました。明日またお試しください。")
+            else:
+                with st.spinner("フィードバックを反映して再マッチング中..."):
+                    _skills = ", ".join(user_skills_selected) if user_skills_selected else ""
+                    st.session_state.results = compute_match_refined(
+                        st.session_state.user_text, df.copy(),
+                        st.session_state.feedback,
+                        st.session_state.user_priorities,
+                        precomputed_emb, _skills,
+                    )
+                    st.session_state.explanations = {}
+                    st.session_state.refine_count += 1
+                st.rerun()
+    else:
+        st.button("フィードバックで絞り込む", disabled=True, use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
     st.divider()
 
@@ -802,6 +1037,8 @@ if st.button("マッチング開始", type="primary", use_container_width=True):
                     st.session_state.user_text = user_text
                     st.session_state.user_priorities = user_priorities
                     st.session_state.explanations = {}
+                    st.session_state.feedback = {}
+                    st.session_state.refine_count = 0
             except Exception:
                 st.error("マッチング処理中にエラーが発生しました。時間をおいて再度お試しください。")
 
@@ -812,6 +1049,19 @@ if st.session_state.results is not None:
     results_df = st.session_state.results.head(display_count)
 
     st.subheader(f"マッチング結果（{len(results_df)}件表示）")
+
+    # 評価済み企業の一覧表示
+    if st.session_state.refine_count >= 1 and st.session_state.feedback:
+        rating_labels = {5: "★★★★★", 4: "★★★★☆", 3: "★★★☆☆", 2: "★★☆☆☆", 1: "★☆☆☆☆"}
+        with st.expander(f"評価済み企業（{len(st.session_state.feedback)}件）"):
+            for comp, fb in st.session_state.feedback.items():
+                rating = fb.get("rating", 0)
+                comment = fb.get("comment", "")
+                stars = rating_labels.get(rating, f"{rating}点")
+                line = f"**{comp}** — {stars}"
+                if comment:
+                    line += f"　（{comment}）"
+                st.markdown(line)
 
     for rank, (i, row) in enumerate(results_df.iterrows(), start=1):
         match_score = row["match_score"]
@@ -868,6 +1118,12 @@ if st.session_state.results is not None:
                     st.markdown('<span class="card-section-label">SCORE REASON</span>', unsafe_allow_html=True)
                     st.markdown(f'<p class="card-text">{html.escape(str(vr))}</p>', unsafe_allow_html=True)
 
+            # 事業活動の折りたたみ表示
+            desc = row.get("description")
+            if pd.notna(desc) and str(desc).strip():
+                with st.expander("事業活動を見る"):
+                    st.markdown(str(desc))
+
             # AI解説
             if company in st.session_state.explanations:
                 st.info(f"**AI解説:** {st.session_state.explanations[company]}")
@@ -915,23 +1171,66 @@ if st.session_state.results is not None:
                                 st.session_state.job_results[company] = {"content": content}
                             st.rerun()
 
-            # リンク
-            link_cols = st.columns(3)
-            with link_cols[0]:
-                hp_url = row.get("homepage_url", "")
-                if pd.notna(hp_url) and str(hp_url).strip() and str(hp_url).strip().startswith("http"):
-                    st.markdown(f"[公式サイト]({hp_url})")
+            # フィードバック（5段階評価 + コメント）
+            current_feedback = st.session_state.feedback.get(company)
+            rating_labels = {1: "違う", 2: "やや違う", 3: "どちらでもない", 4: "やや合っている", 5: "とても合っている"}
+            if current_feedback is None:
+                fb_slider_col, fb_comment_col, fb_btn_col = st.columns([2, 2, 1])
+                with fb_slider_col:
+                    rating_val = st.select_slider(
+                        "評価",
+                        options=[1, 2, 3, 4, 5],
+                        value=3,
+                        format_func=lambda x: f"{x} - {rating_labels[x]}",
+                        key=f"fb_slider_{i}",
+                        label_visibility="collapsed",
+                    )
+                with fb_comment_col:
+                    comment_val = st.text_input(
+                        "コメント（任意）",
+                        key=f"fb_comment_{i}",
+                        placeholder="どこが合っている／違うか等",
+                        label_visibility="collapsed",
+                    )
+                with fb_btn_col:
+                    if st.button("評価する", key=f"fb_submit_{i}", use_container_width=True):
+                        st.session_state.feedback[company] = {
+                            "rating": rating_val,
+                            "comment": comment_val,
+                        }
+                        st.rerun()
+            else:
+                if isinstance(current_feedback, str):
+                    r = 5 if current_feedback == "good" else 1
+                    c = ""
                 else:
-                    st.caption("公式サイト: ---")
-            with link_cols[1]:
-                cr_url = row.get("careers_url", "")
-                if pd.notna(cr_url) and str(cr_url).strip() and str(cr_url).strip().startswith("http"):
-                    st.markdown(f"[採用情報]({cr_url})")
-                else:
-                    st.caption("採用情報: ---")
-            with link_cols[2]:
-                ow_search = "https://www.openwork.jp/company_list?src_str=" + urllib.parse.quote(str(row["company"]))
-                st.markdown(f"[クチコミ（OpenWork）]({ow_search})")
+                    r = current_feedback.get("rating", 3)
+                    c = current_feedback.get("comment", "")
+                stars = "★" * r + "☆" * (5 - r)
+                fb_show_col, fb_cancel_col = st.columns([4, 1])
+                with fb_show_col:
+                    display_text = f"**{stars} {rating_labels.get(r, '')}**"
+                    if c:
+                        display_text += f"　│ {c}"
+                    st.markdown(display_text)
+                with fb_cancel_col:
+                    if st.button("取り消す", key=f"fb_cancel_{i}", use_container_width=True):
+                        del st.session_state.feedback[company]
+                        st.rerun()
+
+            # リンク（存在するもののみ横並び表示）
+            _links = []
+            hp_url = row.get("homepage_url", "")
+            if pd.notna(hp_url) and str(hp_url).strip() and str(hp_url).strip().startswith("http"):
+                _links.append(f'<a href="{hp_url}" target="_blank">公式サイト</a>')
+            cr_url = row.get("careers_url", "")
+            if pd.notna(cr_url) and str(cr_url).strip() and str(cr_url).strip().startswith("http"):
+                _links.append(f'<a href="{cr_url}" target="_blank">採用情報</a>')
+            ow_search = "https://www.openwork.jp/company_list?src_str=" + urllib.parse.quote(str(row["company"]))
+            _links.append(f'<a href="{ow_search}" target="_blank">クチコミ（OpenWork）</a>')
+            if _links:
+                st.markdown('<div class="link-row">' + " | ".join(_links) + "</div>", unsafe_allow_html=True)
+
 
 # フッター
 st.markdown(
