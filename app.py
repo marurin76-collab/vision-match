@@ -639,9 +639,12 @@ st.markdown(
         margin-top: 6px; font-weight: 500;
     }
     .card-section-label {
-        font-size: 0.78em; font-weight: 600; color: #64748b;
+        font-size: 0.85em; font-weight: 600; color: #64748b;
         text-transform: uppercase; letter-spacing: 0.05em;
         margin-bottom: 2px;
+    }
+    .card-text {
+        font-size: 1em; color: #334155; line-height: 1.6;
     }
 
     /* --- 結果カード内の枠線付きコンテナ --- */
@@ -843,10 +846,10 @@ if st.session_state.results is not None:
             mv_col1, mv_col2 = st.columns(2)
             with mv_col1:
                 st.markdown('<span class="card-section-label">MISSION</span>', unsafe_allow_html=True)
-                st.caption(row["mission"] if row["mission"] else "---")
+                st.markdown(f'<p class="card-text">{html.escape(row["mission"] if row["mission"] else "---")}</p>', unsafe_allow_html=True)
             with mv_col2:
                 st.markdown('<span class="card-section-label">VISION</span>', unsafe_allow_html=True)
-                st.caption(row["vision"] if row["vision"] else "---")
+                st.markdown(f'<p class="card-text">{html.escape(row["vision"] if row["vision"] else "---")}</p>', unsafe_allow_html=True)
 
             # --- ビジョン実現度 ---
             detail_col1, detail_col2 = st.columns(2)
@@ -863,7 +866,7 @@ if st.session_state.results is not None:
                 vr = row.get("vision_reason")
                 if pd.notna(vr) and str(vr).strip():
                     st.markdown('<span class="card-section-label">SCORE REASON</span>', unsafe_allow_html=True)
-                    st.caption(str(vr))
+                    st.markdown(f'<p class="card-text">{html.escape(str(vr))}</p>', unsafe_allow_html=True)
 
             # AI解説
             if company in st.session_state.explanations:
